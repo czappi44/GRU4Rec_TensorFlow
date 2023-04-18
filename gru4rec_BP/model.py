@@ -4,7 +4,8 @@ Created on Feb 26, 2017
 @author: Weiping Song
 """
 import os
-import tensorflow as tf
+import time
+import tensorflow.compat.v1 as tf
 from tensorflow.python.ops import rnn_cell
 import pandas as pd
 import numpy as np
@@ -31,6 +32,7 @@ class GRU4Rec:
         self.time_key = args.time_key
         self.grad_cap = args.grad_cap
         self.n_items = args.n_items 
+        self.initial_accumulator_value = args.initial_accumulator_value
         if args.hidden_act == 'tanh':
             self.hidden_act = self.tanh
         elif args.hidden_act == 'relu':
@@ -75,7 +77,7 @@ class GRU4Rec:
             return
 
         # use self.predict_state to hold hidden states during prediction. 
-        self.predict_state = [np.zeros([self.batch_size, self.rnn_size], dtype=np.float32) for _ in xrange(self.layers)]
+        self.predict_state = [np.zeros([self.batch_size, self.rnn_size], dtype=np.float32) for _ in range(self.layers)]
         ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
         if ckpt and ckpt.model_checkpoint_path:
             self.saver.restore(sess, '{}/gru-model-{}'.format(self.checkpoint_dir, args.test_model))
@@ -110,7 +112,7 @@ class GRU4Rec:
         
         self.X = tf.placeholder(tf.int32, [self.batch_size], name='input')
         self.Y = tf.placeholder(tf.int32, [self.batch_size], name='output')
-        self.state = [tf.placeholder(tf.float32, [self.batch_size, self.rnn_size], name='rnn_state') for _ in xrange(self.layers)]
+        self.state = [tf.placeholder(tf.float32, [self.batch_size, self.rnn_size], name='rnn_state') for _ in range(self.layers)]
         self.global_step = tf.Variable(0, name='global_step', trainable=False)
 
         with tf.variable_scope('gru_layer'):
@@ -148,12 +150,13 @@ class GRU4Rec:
             return
 
         self.lr = tf.maximum(1e-5,tf.train.exponential_decay(self.learning_rate, self.global_step, self.decay_steps, self.decay, staircase=True)) 
+        # self.lr = tf.convert_to_tensor(self.learning_rate, dtype=tf.float32)
         
         '''
         Try different optimizers.
         '''
-        #optimizer = tf.train.AdagradOptimizer(self.lr)
-        optimizer = tf.train.AdamOptimizer(self.lr)
+        optimizer = tf.train.AdagradOptimizer(self.lr, initial_accumulator_value=self.initial_accumulator_value) #initial_accumulator_value=1e-12
+        # optimizer = tf.train.AdamOptimizer(self.lr)
         #optimizer = tf.train.AdadeltaOptimizer(self.lr)
         #optimizer = tf.train.RMSPropOptimizer(self.lr)
 
@@ -166,7 +169,7 @@ class GRU4Rec:
         self.train_op = optimizer.apply_gradients(capped_gvs, global_step=self.global_step)
 
     def init(self, data):
-        data.sort([self.session_key, self.time_key], inplace=True)
+        data.sort_values([self.session_key, self.time_key], inplace=True)
         offset_sessions = np.zeros(data[self.session_key].nunique()+1, dtype=np.int32)
         offset_sessions[1:] = data.groupby(self.session_key).size().cumsum()
         return offset_sessions
@@ -179,9 +182,11 @@ class GRU4Rec:
         data = pd.merge(data, pd.DataFrame({self.item_key:itemids, 'ItemIdx':self.itemidmap[itemids].values}), on=self.item_key, how='inner')
         offset_sessions = self.init(data)
         print('fitting model...')
-        for epoch in xrange(self.n_epochs):
+        for epoch in range(self.n_epochs):
+            epoch_start = time.time()
             epoch_cost = []
-            state = [np.zeros([self.batch_size, self.rnn_size], dtype=np.float32) for _ in xrange(self.layers)]
+            events = []
+            state = [np.zeros([self.batch_size, self.rnn_size], dtype=np.float32) for _ in range(self.layers)]
             session_idx_arr = np.arange(len(offset_sessions)-1)
             iters = np.arange(self.batch_size)
             maxiter = iters.max()
@@ -197,18 +202,16 @@ class GRU4Rec:
                     # prepare inputs, targeted outputs and hidden states
                     fetches = [self.cost, self.final_state, self.global_step, self.lr, self.train_op]
                     feed_dict = {self.X: in_idx, self.Y: out_idx}
-                    for j in xrange(self.layers): 
+                    for j in range(self.layers): 
                         feed_dict[self.state[j]] = state[j]
                     
-                    cost, state, step, lr, _ = self.sess.run(fetches, feed_dict)
-                    epoch_cost.append(cost)
-                    if np.isnan(cost):
+                    c, state, step, lr, _ = self.sess.run(fetches, feed_dict)
+                    events.append(len(in_idx))
+                    epoch_cost.append(c)
+                    if np.isnan(c):
                         print(str(epoch) + ':Nan error!')
                         self.error_during_train = True
                         return
-                    if step == 1 or step % self.decay_steps == 0:
-                        avgc = np.mean(epoch_cost)
-                        print('Epoch {}\tStep {}\tlr: {:.6f}\tloss: {:.6f}'.format(epoch, step, lr, avgc))
                 start = start+minlen-1
                 mask = np.arange(len(iters))[(end-start)<=1]
                 for idx in mask:
@@ -220,10 +223,12 @@ class GRU4Rec:
                     start[idx] = offset_sessions[session_idx_arr[maxiter]]
                     end[idx] = offset_sessions[session_idx_arr[maxiter]+1]
                 if len(mask) and self.reset_after_session:
-                    for i in xrange(self.layers):
+                    for i in range(self.layers):
                         state[i][mask] = 0
             
             avgc = np.mean(epoch_cost)
+            epoch_end = time.time() - epoch_start
+            print(f'epoch:{epoch} loss: {avgc:.6f} {epoch_end:.2f} s {np.sum(events)/epoch_end:.2f} e/s {len(epoch_cost)/epoch_end:.2f} mb/s')
             if np.isnan(avgc):
                 print('Epoch {}: Nan error!'.format(epoch, avgc))
                 self.error_during_train = True
@@ -261,14 +266,14 @@ class GRU4Rec:
         
         session_change = np.arange(batch)[session_ids != self.current_session]
         if len(session_change) > 0: # change internal states with session changes
-            for i in xrange(self.layers):
+            for i in range(self.layers):
                 self.predict_state[i][session_change] = 0.0
             self.current_session=session_ids.copy()
 
         in_idxs = itemidmap[input_item_ids]
         fetches = [self.yhat, self.final_state]
         feed_dict = {self.X: in_idxs}
-        for i in xrange(self.layers):
+        for i in range(self.layers):
             feed_dict[self.state[i]] = self.predict_state[i]
         preds, self.predict_state = self.sess.run(fetches, feed_dict)
         preds = np.asarray(preds).T
